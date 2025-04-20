@@ -82,7 +82,7 @@ impl Camera {
         let projection_matrix = Mat4::perspective_rh(fovy.to_radians(), aspect, znear, zfar);
         let view_matrix = Mat4::look_at_rh(position, target, up);
         
-        let mut uniform = CameraUniform::new();
+        let uniform = CameraUniform::new();
         
         // Create the bind group layout
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

@@ -1,8 +1,10 @@
 use crate::camera::Camera;
-use wgpu::{util::DeviceExt, Backend};
+use crate::elevation::ElevationData;
+use wgpu::util::DeviceExt;
 use h3o::{CellIndex, LatLng, Resolution};
 use glam::Mat4;
 use bytemuck::{Pod, Zeroable};
+use std::sync::Arc;
 
 const EARTH_RADIUS: f32 = 1.0; // Normalized globe radius
 
@@ -111,15 +113,19 @@ pub struct Globe {
     
     // Rendering mode
     render_solid: bool,
+    
+    // Elevation data
+    elevation_data: Option<Arc<ElevationData>>,
 }
 
 impl Globe {
-    pub fn new(device: &wgpu::Device, resolution: H3Resolution) -> Self {
-        // Generate a color palette for base cells
+    pub fn new(device: &wgpu::Device, resolution: H3Resolution, elevation_data: Option<Arc<ElevationData>>) -> Self {
+        // Generate a color palette for base cells (used as fallback if no elevation data)
         let base_cell_colors = generate_base_cell_colors();
 
         // Create initial H3 cells
-        let (vertices, indices, triangle_indices) = generate_h3_cells(&resolution);
+        // If elevation data is provided, it will be used for coloring
+        let (vertices, indices, triangle_indices) = generate_h3_cells_with_elevation(&resolution, elevation_data.clone());
         
         // Create vertex and index buffers
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -227,7 +233,6 @@ impl Globe {
                 topology: wgpu::PrimitiveTopology::LineList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                //cull_mode: Some(wgpu::Face::Back),
                 cull_mode: None,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
@@ -265,6 +270,7 @@ impl Globe {
             device: device.clone(),
             base_cell_colors,
             render_solid: false,
+            elevation_data,
         }
     }
     
@@ -316,8 +322,8 @@ impl Globe {
     }
     
     fn regenerate_geometry(&mut self) {
-        // Generate new geometry for the updated resolution
-        let (vertices, indices, triangle_indices) = generate_h3_cells(&self.h3_resolution);
+        // Generate new geometry for the updated resolution, using elevation data if available
+        let (vertices, indices, triangle_indices) = generate_h3_cells_with_elevation(&self.h3_resolution, self.elevation_data.clone());
         
         // Create new buffers - ensure we have at least some valid indices
         let index_data = if indices.is_empty() {
@@ -595,7 +601,7 @@ fn generate_h3_cells(resolution: &H3Resolution) -> (Vec<Vertex>, Vec<u32>, Vec<u
 }
 
 // Generate all base cells (resolution 0)
-fn generate_h3_base_cells(res: Resolution, vertices: &mut Vec<Vertex>, line_indices: &mut Vec<u32>, triangle_indices: &mut Vec<u32>) {
+fn generate_h3_base_cells(_res: Resolution, vertices: &mut Vec<Vertex>, line_indices: &mut Vec<u32>, triangle_indices: &mut Vec<u32>) {
     // Iterate through all base cells (122 at resolution 0)
     for base_index in 0..122u64 {
         // Try to create a cell index for this base cell
@@ -1096,4 +1102,217 @@ fn add_great_arc_edges(boundary: &[LatLng], base_index: u32, vertices: &mut Vec<
             }
         }
     }
+}
+
+// Generate H3 cells with elevation-based coloring
+fn generate_h3_cells_with_elevation(resolution: &H3Resolution, elevation_data: Option<Arc<ElevationData>>) -> (Vec<Vertex>, Vec<u32>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut line_indices = Vec::new();
+    let mut triangle_indices = Vec::new();
+    
+    // Get actual resolution value (0-15)
+    let res_value = resolution.value();
+    
+    println!("Generating H3 cells at resolution {} with elevation data...", res_value);
+    
+    // At resolution 0, we'll display the base icosahedron for context
+    if res_value == 0 {
+        // Add the base icosahedron
+        create_icosahedron_base(&mut vertices, &mut line_indices);
+        
+        // Get all base cells (resolution 0) using h3o
+        let h3_res = Resolution::try_from(0).unwrap(); // Resolution 0
+        
+        // Generate and add all resolution 0 cells
+        generate_h3_base_cells_with_elevation(h3_res, &mut vertices, &mut line_indices, &mut triangle_indices, elevation_data.clone());
+    } else {
+        // For higher resolutions, we'll generate cells based on a coverage area
+        let h3_res = Resolution::try_from(res_value as u8).unwrap();
+        generate_h3_cells_by_resolution_with_elevation(h3_res, &mut vertices, &mut line_indices, &mut triangle_indices, elevation_data.clone());
+    }
+    
+    println!("Created {} vertices, {} line indices, and {} triangle indices", 
+             vertices.len(), line_indices.len(), triangle_indices.len());
+    
+    (vertices, line_indices, triangle_indices)
+}
+
+// Generate all base cells (resolution 0) with elevation coloring
+fn generate_h3_base_cells_with_elevation(
+    _res: Resolution, 
+    vertices: &mut Vec<Vertex>, 
+    line_indices: &mut Vec<u32>, 
+    triangle_indices: &mut Vec<u32>,
+    elevation_data: Option<Arc<ElevationData>>
+) {
+    // Iterate through all base cells (122 at resolution 0)
+    for base_index in 0..122u64 {
+        // Try to create a cell index for this base cell
+        if let Ok(cell_index) = CellIndex::try_from(base_index) {
+            // Get the boundary of this cell
+            let boundary = cell_index.boundary();
+            add_h3_cell_boundary_with_elevation(cell_index, &boundary, vertices, line_indices, triangle_indices, elevation_data.clone());
+        }
+    }
+}
+
+// Generate H3 cells at a specific resolution with elevation-based coloring
+fn generate_h3_cells_by_resolution_with_elevation(
+    res: Resolution, 
+    vertices: &mut Vec<Vertex>, 
+    line_indices: &mut Vec<u32>, 
+    triangle_indices: &mut Vec<u32>,
+    elevation_data: Option<Arc<ElevationData>>
+) {
+    // For higher resolutions, we can't render the whole globe at once
+    // So we'll focus on a section with reasonable density
+    
+    // Sample area covering a section of the globe with visible cells
+    // These are the same sample points as before
+    let sample_points = [
+        // North America
+        (37.7749, -122.4194),   // San Francisco
+        (40.7128, -74.0060),    // New York
+        // Europe
+        (51.5074, -0.1278),     // London
+        (48.8566, 2.3522),      // Paris
+        // Asia
+        (35.6762, 139.6503),    // Tokyo
+        (1.3521, 103.8198),     // Singapore
+        // Africa
+        (-33.9249, 18.4241),    // Cape Town
+        // Australia
+        (-33.8688, 151.2093),   // Sydney
+    ];
+    
+    let res_val = u8::from(res);
+    
+    // For resolutions 0-4, we'll render all cells (no limit)
+    // For higher resolutions, limit to prevent overwhelming the GPU
+    let max_rings = match res_val {
+        0 => 100, // Effectively unlimited for res 0
+        1 => 100, // Effectively unlimited for res 1
+        2 => 100, // Effectively unlimited for res 2
+        3 => 100, // Effectively unlimited for res 3
+        4 => 100, // Effectively unlimited for res 4
+        5 => 4,
+        6 => 3,
+        7 => 2,
+        _ => 1  // For very high resolutions, limit to 1 ring
+    };
+    
+    println!("Using {} rings at resolution {}", max_rings, res_val);
+    
+    for (lat, lng) in sample_points.iter() {
+        // Convert lat/lng to H3 cell
+        let center_point = LatLng::new(*lat, *lng).expect("Valid lat/lng");
+        let center_cell = center_point.to_cell(res);
+        
+        // Get the cell and its rings
+        let cells = if max_rings > 0 { 
+            center_cell.grid_disk(max_rings)
+        } else {
+            // For very high resolutions, just get the center cell
+            vec![center_cell]
+        };
+        
+        println!("Generated {} cells around point {}, {}", cells.len(), lat, lng);
+        
+        // Add all cells in the collection
+        for cell in cells {
+            let boundary = cell.boundary();
+            add_h3_cell_boundary_with_elevation(cell, &boundary, vertices, line_indices, triangle_indices, elevation_data.clone());
+        }
+    }
+    
+    // Always include the 12 pentagon cells at the current resolution
+    add_pentagon_cells_with_elevation(res, vertices, line_indices, triangle_indices, elevation_data);
+}
+
+// Add pentagon cells with elevation data
+fn add_pentagon_cells_with_elevation(
+    res: Resolution, 
+    vertices: &mut Vec<Vertex>, 
+    line_indices: &mut Vec<u32>, 
+    triangle_indices: &mut Vec<u32>,
+    elevation_data: Option<Arc<ElevationData>>
+) {
+    // Start with 12 base icosahedron pentagons and get their children at the desired resolution
+    for base_index in 0..122u64 {
+        if let Ok(cell_index) = CellIndex::try_from(base_index) {
+            // Check if this is a pentagon
+            if cell_index.is_pentagon() {
+                // For resolution 0, we already added this pentagon
+                if u8::from(res) == 0 {
+                    continue;
+                }
+                
+                // For higher resolutions, get the descendant pentagon
+                let pentagon_at_res = get_pentagon_descendant(cell_index, res);
+                let boundary = pentagon_at_res.boundary();
+                
+                // Add with special coloring for pentagons - elevation data is secondary for these special cells
+                add_h3_cell_boundary_with_elevation(pentagon_at_res, &boundary, vertices, line_indices, triangle_indices, elevation_data.clone());
+            }
+        }
+    }
+}
+
+// Add an H3 cell boundary with elevation-based coloring
+fn add_h3_cell_boundary_with_elevation(
+    cell: CellIndex, 
+    boundary: &[LatLng], 
+    vertices: &mut Vec<Vertex>, 
+    line_indices: &mut Vec<u32>, 
+    triangle_indices: &mut Vec<u32>,
+    elevation_data: Option<Arc<ElevationData>>
+) {
+    let vertex_start_index = vertices.len() as u32;
+    let is_pentagon = cell.is_pentagon();
+    
+    // Get color based on elevation if available, otherwise use old coloring scheme
+    let color = if let Some(elev_data) = &elevation_data {
+        // For pentagons, always use a special color to highlight them
+        if is_pentagon {
+            [0.9, 0.1, 0.1] // Red for pentagons
+        } else {
+            // Get the color based on elevation
+            elev_data.get_color_for_cell(cell)
+        }
+    } else {
+        // Fall back to old coloring scheme
+        if is_pentagon {
+            [0.9, 0.1, 0.1] // Red for pentagons
+        } else {
+            // Create a quasi-unique color based on the cell index
+            let h3_index = u64::from(cell);
+            let hue = ((h3_index % 360) as f32) / 360.0;
+            
+            // Simple HSV to RGB conversion for varying colors
+            hsv_to_rgb(hue, 0.7, 0.8)
+        }
+    };
+    
+    // Add vertices for the boundary points
+    for point in boundary {
+        let pos = lat_lng_to_point(point.lat_radians().to_degrees(), point.lng_radians().to_degrees());
+        let normal = calculate_normal(pos);
+        
+        vertices.push(Vertex {
+            position: pos,
+            normal,
+            color,
+        });
+    }
+    
+    // Connect boundary vertices to form edges (for LineList topology)
+    let num_vertices = boundary.len();
+    for i in 0..num_vertices {
+        let next = (i + 1) % num_vertices;
+        line_indices.push(vertex_start_index + i as u32);
+        line_indices.push(vertex_start_index + next as u32);
+    }
+    
+    // Generate triangles for solid face rendering
+    add_cell_face_triangles(boundary, vertex_start_index, vertices, triangle_indices, color);
 }

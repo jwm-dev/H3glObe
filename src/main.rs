@@ -9,11 +9,15 @@ use winit::{
 mod camera;
 mod globe;
 mod render;
+mod elevation;
 
 use camera::Camera;
 use globe::{Globe, H3Resolution};
+use h3o::Resolution;
+use std::path::Path;
+use std::thread;
 
-const WINDOW_TITLE: &str = "H3glObe - H3 Geospatial Visualization";
+const WINDOW_TITLE: &str = "H3glObe - H3 Geospatial Visualization with Elevation";
 
 fn main() {
     env_logger::init();
@@ -102,8 +106,30 @@ impl State {
         
         surface.configure(&device, &config);
 
-        // Initialize globe with default resolution
-        let globe = Globe::new(&device, H3Resolution::new(2));
+        // Initialize elevation data
+        println!("Initializing elevation data...");
+        let etopo_path = Path::new("assets/etopo15s_tifs");
+        let elevation_data = elevation::ElevationData::initialize(etopo_path);
+        
+        // Preload elevation data for lower resolutions in a separate thread
+        // to avoid blocking the main thread during startup
+        let elevation_data_clone = elevation_data.clone();
+        thread::spawn(move || {
+            println!("Preloading elevation data for resolutions 0-4...");
+            // Preload data for resolutions 0-4
+            for i in 0..5 {
+                let res = Resolution::try_from(i).unwrap();
+                elevation_data_clone.preload_elevation_data(res);
+            }
+            println!("Preloading complete!");
+        });
+        
+        // Default starting resolution
+        let default_resolution = 2;
+        println!("Initializing globe with resolution {}...", default_resolution);
+        
+        // Initialize globe with elevation data and default resolution
+        let globe = Globe::new(&device, H3Resolution::new(default_resolution), Some(elevation_data));
         
         // Initialize camera
         let camera = Camera::new(
