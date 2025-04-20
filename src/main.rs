@@ -301,6 +301,8 @@ impl winit::application::ApplicationHandler for H3GlobeApp {
                         state.globe.increase_resolution();
                     } else if key == "-" || key == "_" {
                         state.globe.decrease_resolution();
+                    } else if key == "m" || key == "M" {
+                        state.globe.toggle_render_mode();
                     }
                 }
                 _ => {}

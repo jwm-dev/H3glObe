@@ -87,7 +87,9 @@ pub struct Globe {
     // Buffers
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    triangle_index_buffer: wgpu::Buffer, // Separate buffer for triangle indices
     num_indices: u32,
+    num_triangle_indices: u32,          // Count of triangle indices
     
     // Uniform binding
     globe_uniform: GlobeUniform,
@@ -106,6 +108,9 @@ pub struct Globe {
     
     // Base cell colors
     base_cell_colors: Vec<[f32; 3]>,
+    
+    // Rendering mode
+    render_solid: bool,
 }
 
 impl Globe {
@@ -114,7 +119,7 @@ impl Globe {
         let base_cell_colors = generate_base_cell_colors();
 
         // Create initial H3 cells
-        let (vertices, indices) = generate_h3_cells(&resolution);
+        let (vertices, indices, triangle_indices) = generate_h3_cells(&resolution);
         
         // Create vertex and index buffers
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -126,6 +131,12 @@ impl Globe {
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Index Buffer"),
             contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let triangle_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Triangle Index Buffer"),
+            contents: bytemuck::cast_slice(&triangle_indices),
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         });
         
@@ -242,7 +253,9 @@ impl Globe {
             pipeline,
             vertex_buffer,
             index_buffer,
+            triangle_index_buffer,
             num_indices: indices.len() as u32,
+            num_triangle_indices: triangle_indices.len() as u32,
             globe_uniform,
             globe_uniform_buffer,
             globe_bind_group,
@@ -251,16 +264,26 @@ impl Globe {
             h3_resolution: resolution,
             device: device.clone(),
             base_cell_colors,
+            render_solid: false,
         }
     }
     
     pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, camera: &'a Camera) {
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-        render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-        render_pass.set_bind_group(0, &self.globe_bind_group, &[]);
-        render_pass.set_bind_group(1, camera.bind_group(), &[]);
-        render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+        
+        // Use the correct index buffer based on render mode
+        if self.render_solid {
+            render_pass.set_index_buffer(self.triangle_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.set_bind_group(0, &self.globe_bind_group, &[]);
+            render_pass.set_bind_group(1, camera.bind_group(), &[]);
+            render_pass.draw_indexed(0..self.num_triangle_indices, 0, 0..1);
+        } else {
+            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            render_pass.set_bind_group(0, &self.globe_bind_group, &[]);
+            render_pass.set_bind_group(1, camera.bind_group(), &[]);
+            render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+        }
     }
     
     pub fn depth_texture_view(&self) -> &wgpu::TextureView {
@@ -294,13 +317,19 @@ impl Globe {
     
     fn regenerate_geometry(&mut self) {
         // Generate new geometry for the updated resolution
-        let (vertices, indices) = generate_h3_cells(&self.h3_resolution);
+        let (vertices, indices, triangle_indices) = generate_h3_cells(&self.h3_resolution);
         
         // Create new buffers - ensure we have at least some valid indices
         let index_data = if indices.is_empty() {
             vec![0u32, 0, 0] // Fallback triangle to prevent empty buffer errors
         } else {
             indices
+        };
+
+        let triangle_index_data = if triangle_indices.is_empty() {
+            vec![0u32, 0, 0] // Fallback triangle to prevent empty buffer errors
+        } else {
+            triangle_indices
         };
         
         let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -314,13 +343,125 @@ impl Globe {
             contents: bytemuck::cast_slice(&index_data),
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         });
+
+        let triangle_index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Triangle Index Buffer"),
+            contents: bytemuck::cast_slice(&triangle_index_data),
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        });
         
         // Update buffer references
         self.vertex_buffer = vertex_buffer;
         self.index_buffer = index_buffer;
+        self.triangle_index_buffer = triangle_index_buffer;
         self.num_indices = index_data.len() as u32;
+        self.num_triangle_indices = triangle_index_data.len() as u32;
         
-        println!("Regenerated geometry with {} indices", self.num_indices);
+        println!("Regenerated geometry with {} indices and {} triangle indices", self.num_indices, self.num_triangle_indices);
+    }
+
+    pub fn toggle_render_mode(&mut self) {
+        self.render_solid = !self.render_solid;
+        self.update_pipeline();
+        println!("Render mode: {}", if self.render_solid { "Solid" } else { "Wireframe" });
+    }
+    
+    pub fn set_render_solid(&mut self, solid: bool) {
+        if self.render_solid != solid {
+            self.render_solid = solid;
+            self.update_pipeline();
+        }
+    }
+    
+    pub fn is_render_solid(&self) -> bool {
+        self.render_solid
+    }
+    
+    fn update_pipeline(&mut self) {
+        // Load shaders
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Globe Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shader.wgsl").into()),
+        });
+        
+        // Create the globe bind group layout
+        let globe_bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Globe Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        
+        // Create pipeline layout
+        let pipeline_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Globe Pipeline Layout"),
+            bind_group_layouts: &[
+                &globe_bind_group_layout,
+                &create_camera_bind_group_layout(&self.device),
+            ],
+            push_constant_ranges: &[],
+        });
+        
+        // Create render pipeline with updated topology based on render mode
+        self.pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Globe Render Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some(if self.render_solid { "fs_main_solid" } else { "fs_main" }),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: if self.render_solid { 
+                    wgpu::PrimitiveTopology::TriangleList 
+                } else { 
+                    wgpu::PrimitiveTopology::LineList 
+                },
+                strip_index_format: None,
+                // Fix for backwards culling - changing from CCW to CW front face winding
+                front_face: if self.render_solid {
+                    wgpu::FrontFace::Cw
+                } else {
+                    wgpu::FrontFace::Ccw
+                },
+                cull_mode: if self.render_solid { Some(wgpu::Face::Back) } else { None },
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
     }
 }
 
@@ -421,9 +562,10 @@ fn calculate_normal(vertex: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-fn generate_h3_cells(resolution: &H3Resolution) -> (Vec<Vertex>, Vec<u32>) {
+fn generate_h3_cells(resolution: &H3Resolution) -> (Vec<Vertex>, Vec<u32>, Vec<u32>) {
     let mut vertices = Vec::new();
-    let mut indices = Vec::new();
+    let mut line_indices = Vec::new();
+    let mut triangle_indices = Vec::new();
     
     // Get actual resolution value (0-15)
     let res_value = resolution.value();
@@ -433,39 +575,40 @@ fn generate_h3_cells(resolution: &H3Resolution) -> (Vec<Vertex>, Vec<u32>) {
     // At resolution 0, we'll display the base icosahedron for context
     if res_value == 0 {
         // Add the base icosahedron
-        create_icosahedron_base(&mut vertices, &mut indices);
+        create_icosahedron_base(&mut vertices, &mut line_indices);
         
         // Get all base cells (resolution 0) using h3o
         let h3_res = Resolution::try_from(0).unwrap(); // Resolution 0
         
         // Generate and add all resolution 0 cells
-        generate_h3_base_cells(h3_res, &mut vertices, &mut indices);
+        generate_h3_base_cells(h3_res, &mut vertices, &mut line_indices, &mut triangle_indices);
     } else {
         // For higher resolutions, we'll generate cells based on a coverage area
         let h3_res = Resolution::try_from(res_value as u8).unwrap();
-        generate_h3_cells_by_resolution(h3_res, &mut vertices, &mut indices);
+        generate_h3_cells_by_resolution(h3_res, &mut vertices, &mut line_indices, &mut triangle_indices);
     }
     
-    println!("Created {} vertices and {} indices", vertices.len(), indices.len());
+    println!("Created {} vertices, {} line indices, and {} triangle indices", 
+             vertices.len(), line_indices.len(), triangle_indices.len());
     
-    (vertices, indices)
+    (vertices, line_indices, triangle_indices)
 }
 
 // Generate all base cells (resolution 0)
-fn generate_h3_base_cells(res: Resolution, vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
+fn generate_h3_base_cells(res: Resolution, vertices: &mut Vec<Vertex>, line_indices: &mut Vec<u32>, triangle_indices: &mut Vec<u32>) {
     // Iterate through all base cells (122 at resolution 0)
     for base_index in 0..122u64 {
         // Try to create a cell index for this base cell
         if let Ok(cell_index) = CellIndex::try_from(base_index) {
             // Get the boundary of this cell
             let boundary = cell_index.boundary();
-            add_h3_cell_boundary(cell_index, &boundary, vertices, indices);
+            add_h3_cell_boundary(cell_index, &boundary, vertices, line_indices, triangle_indices);
         }
     }
 }
 
 // Generate H3 cells at a specific resolution within a view area
-fn generate_h3_cells_by_resolution(res: Resolution, vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
+fn generate_h3_cells_by_resolution(res: Resolution, vertices: &mut Vec<Vertex>, line_indices: &mut Vec<u32>, triangle_indices: &mut Vec<u32>) {
     // For higher resolutions, we can't render the whole globe at once
     // So we'll focus on a section with reasonable density
     
@@ -523,16 +666,16 @@ fn generate_h3_cells_by_resolution(res: Resolution, vertices: &mut Vec<Vertex>, 
         // Add all cells in the collection
         for cell in cells {
             let boundary = cell.boundary();
-            add_h3_cell_boundary(cell, &boundary, vertices, indices);
+            add_h3_cell_boundary(cell, &boundary, vertices, line_indices, triangle_indices);
         }
     }
     
     // Always include the 12 pentagon cells at the current resolution
-    add_pentagon_cells(res, vertices, indices);
+    add_pentagon_cells(res, vertices, line_indices, triangle_indices);
 }
 
 // Add the 12 pentagon cells at the specified resolution
-fn add_pentagon_cells(res: Resolution, vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
+fn add_pentagon_cells(res: Resolution, vertices: &mut Vec<Vertex>, line_indices: &mut Vec<u32>, triangle_indices: &mut Vec<u32>) {
     // Start with 12 base icosahedron pentagons and get their children at the desired resolution
     for base_index in 0..122u64 {
         if let Ok(cell_index) = CellIndex::try_from(base_index) {
@@ -548,7 +691,7 @@ fn add_pentagon_cells(res: Resolution, vertices: &mut Vec<Vertex>, indices: &mut
                 let boundary = pentagon_at_res.boundary();
                 
                 // Add with special coloring for pentagons
-                add_h3_cell_boundary(pentagon_at_res, &boundary, vertices, indices);
+                add_h3_cell_boundary(pentagon_at_res, &boundary, vertices, line_indices, triangle_indices);
             }
         }
     }
@@ -583,7 +726,7 @@ fn get_pentagon_descendant(base_cell: CellIndex, target_res: Resolution) -> Cell
 }
 
 // Add an H3 cell boundary to our vertex and index buffers
-fn add_h3_cell_boundary(cell: CellIndex, boundary: &[LatLng], vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
+fn add_h3_cell_boundary(cell: CellIndex, boundary: &[LatLng], vertices: &mut Vec<Vertex>, line_indices: &mut Vec<u32>, triangle_indices: &mut Vec<u32>) {
     let vertex_start_index = vertices.len() as u32;
     let is_pentagon = cell.is_pentagon();
     
@@ -615,63 +758,68 @@ fn add_h3_cell_boundary(cell: CellIndex, boundary: &[LatLng], vertices: &mut Vec
     let num_vertices = boundary.len();
     for i in 0..num_vertices {
         let next = (i + 1) % num_vertices;
-        indices.push(vertex_start_index + i as u32);
-        indices.push(vertex_start_index + next as u32);
+        line_indices.push(vertex_start_index + i as u32);
+        line_indices.push(vertex_start_index + next as u32);
     }
     
-    // For higher detail, add great arcs between vertices
-    if num_vertices > 0 && cell.resolution() < Resolution::Five {
-        add_great_arc_edges(boundary, vertex_start_index, vertices, indices, color);
-    }
+    // Generate triangles for solid face rendering
+    add_cell_face_triangles(boundary, vertex_start_index, vertices, triangle_indices, color);
 }
 
-// Add great arc edges between boundary points for smoother cell rendering
-fn add_great_arc_edges(boundary: &[LatLng], base_index: u32, vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, color: [f32; 3]) {
-    let segments = 8; // Number of segments per edge
-    let num_points = boundary.len();
+// Generate triangles for solid face rendering of a cell
+fn add_cell_face_triangles(boundary: &[LatLng], vertex_start_index: u32, vertices: &mut Vec<Vertex>, triangle_indices: &mut Vec<u32>, color: [f32; 3]) {
+    if boundary.len() < 3 {
+        return; // Need at least 3 vertices to form a triangle
+    }
     
-    for i in 0..num_points {
-        let next = (i + 1) % num_points;
+    // Better center calculation - use 3D centroid instead of lat/lng averaging
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_z = 0.0;
+    
+    // Calculate centroid in 3D Cartesian space (proper for spherical geometry)
+    for point in boundary {
+        let pos = lat_lng_to_point(point.lat_radians().to_degrees(), point.lng_radians().to_degrees());
+        sum_x += pos[0] as f64;
+        sum_y += pos[1] as f64;
+        sum_z += pos[2] as f64;
+    }
+    
+    let count = boundary.len() as f64;
+    let center_x = sum_x / count;
+    let center_y = sum_y / count;
+    let center_z = sum_z / count;
+    
+    // Project the centroid back to the sphere surface
+    let center_length = (center_x * center_x + center_y * center_y + center_z * center_z).sqrt();
+    let scale = EARTH_RADIUS as f64 / center_length;
+    
+    let center_pos = [
+        (center_x * scale) as f32,
+        (center_y * scale) as f32,
+        (center_z * scale) as f32
+    ];
+    
+    let center_normal = calculate_normal(center_pos);
+    
+    // Add the center vertex
+    let center_index = vertices.len() as u32;
+    vertices.push(Vertex {
+        position: center_pos,
+        normal: center_normal,
+        color: [color[0] * 0.95, color[1] * 0.95, color[2] * 0.95], // Slightly darker for center
+    });
+    
+    // Create triangles using fan triangulation from center
+    let num_vertices = boundary.len();
+    for i in 0..num_vertices {
+        let next = (i + 1) % num_vertices;
         
-        // Get 3D positions of the two endpoints
-        let p1 = lat_lng_to_point(boundary[i].lat_radians().to_degrees(), boundary[i].lng_radians().to_degrees());
-        let p2 = lat_lng_to_point(boundary[next].lat_radians().to_degrees(), boundary[next].lng_radians().to_degrees());
-        
-        // Create great arc points
-        let arc_points = create_great_arc(p1, p2, segments);
-        
-        // Skip first and last points as they're the original vertices
-        let first_new_vertex = vertices.len() as u32;
-        for j in 1..arc_points.len() - 1 {
-            let pos = arc_points[j];
-            let normal = calculate_normal(pos);
-            
-            vertices.push(Vertex {
-                position: pos,
-                normal,
-                color,
-            });
-        }
-        
-        // Connect segments
-        if segments > 2 {
-            // Connect start to first internal point
-            indices.push(base_index + i as u32);
-            indices.push(first_new_vertex);
-            
-            // Connect internal points
-            let internal_points = (segments - 2) as u32;
-            for j in 0..internal_points - 1 {
-                indices.push(first_new_vertex + j);
-                indices.push(first_new_vertex + j + 1);
-            }
-            
-            // Connect last internal point to end
-            if internal_points > 0 {  // Ensure we have at least one internal point
-                indices.push(first_new_vertex + internal_points - 1);
-                indices.push(base_index + next as u32);
-            }
-        }
+        // Add triangle: center -> current -> next
+        // These are added AFTER the line indices and don't interfere with them
+        triangle_indices.push(center_index);
+        triangle_indices.push(vertex_start_index + i as u32);
+        triangle_indices.push(vertex_start_index + next as u32);
     }
 }
 
@@ -898,4 +1046,54 @@ fn create_icosahedron_base(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
 fn normalize(v: [f32; 3]) -> [f32; 3] {
     let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     [v[0] / length, v[1] / length, v[2] / length]
+}
+
+// Add great arc edges between boundary points for smoother cell rendering
+fn add_great_arc_edges(boundary: &[LatLng], base_index: u32, vertices: &mut Vec<Vertex>, line_indices: &mut Vec<u32>, color: [f32; 3]) {
+    let segments = 8; // Number of segments per edge
+    let num_points = boundary.len();
+    
+    for i in 0..num_points {
+        let next = (i + 1) % num_points;
+        
+        // Get 3D positions of the two endpoints
+        let p1 = lat_lng_to_point(boundary[i].lat_radians().to_degrees(), boundary[i].lng_radians().to_degrees());
+        let p2 = lat_lng_to_point(boundary[next].lat_radians().to_degrees(), boundary[next].lng_radians().to_degrees());
+        
+        // Create great arc points
+        let arc_points = create_great_arc(p1, p2, segments);
+        
+        // Skip first and last points as they're the original vertices
+        let first_new_vertex = vertices.len() as u32;
+        for j in 1..arc_points.len() - 1 {
+            let pos = arc_points[j];
+            let normal = calculate_normal(pos);
+            
+            vertices.push(Vertex {
+                position: pos,
+                normal,
+                color,
+            });
+        }
+        
+        // Connect segments
+        if segments > 2 {
+            // Connect start to first internal point
+            line_indices.push(base_index + i as u32);
+            line_indices.push(first_new_vertex);
+            
+            // Connect internal points
+            let internal_points = (segments - 2) as u32;
+            for j in 0..internal_points - 1 {
+                line_indices.push(first_new_vertex + j);
+                line_indices.push(first_new_vertex + j + 1);
+            }
+            
+            // Connect last internal point to end
+            if internal_points > 0 {  // Ensure we have at least one internal point
+                line_indices.push(first_new_vertex + internal_points - 1);
+                line_indices.push(base_index + next as u32);
+            }
+        }
+    }
 }
