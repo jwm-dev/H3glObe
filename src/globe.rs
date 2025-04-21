@@ -442,9 +442,9 @@ impl Globe {
                     wgpu::PrimitiveTopology::LineList 
                 },
                 strip_index_format: None,
-                // Fix for backwards culling - changing from CCW to CW front face winding
+                // Fix for backwards culling - changing from CW to CcW for front face winding
                 front_face: if self.render_solid {
-                    wgpu::FrontFace::Cw
+                    wgpu::FrontFace::Ccw
                 } else {
                     wgpu::FrontFace::Ccw
                 },
@@ -544,14 +544,14 @@ fn generate_base_cell_colors() -> Vec<[f32; 3]> {
     colors
 }
 
-// Convert lat/lng to 3D point on a sphere (CORRECTED VERSION)
+// Convert lat/lng to 3D point on a sphere (CORRECTED^2 VERSION)
 fn lat_lng_to_point(lat: f64, lng: f64) -> [f32; 3] {
     let lat_rad = lat.to_radians();
     let lng_rad = lng.to_radians();
     
     // Standard spherical to Cartesian conversion
-    let x = (lng_rad.cos() * lat_rad.cos()) as f32 * EARTH_RADIUS; 
-    let z = (lng_rad.sin() * lat_rad.cos()) as f32 * EARTH_RADIUS;
+    let x = ((-lng_rad).cos() * lat_rad.cos()) as f32 * EARTH_RADIUS; 
+    let z = ((-lng_rad).sin() * lat_rad.cos()) as f32 * EARTH_RADIUS;
     let y = (lat_rad.sin()) as f32 * EARTH_RADIUS;
     
     [x, y, z]
