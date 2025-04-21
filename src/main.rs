@@ -2,7 +2,7 @@ use std::time::Instant;
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
-    keyboard::{Key, NamedKey},
+    keyboard::{KeyCode, PhysicalKey, Key, NamedKey},
     window::{Window, WindowAttributes},
 };
 
@@ -30,7 +30,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     
     // Run the event loop with our application handler
-    event_loop.run_app(&mut app).unwrap();
+    event_loop.run_app(&mut app).expect("Event loop error");
 }
 
 // Remove the lifetime from State struct
@@ -176,6 +176,11 @@ impl State {
         let dt = now - self.last_frame_time;
         self.last_frame_time = now;
         
+        // Check if a resolution change has completed
+        if self.globe.check_resolution_loading() {
+            println!("Resolution now at: {}", u8::from(self.globe.get_resolution()));
+        }
+        
         self.camera.update(dt.as_secs_f32());
         self.camera.update_buffer(&self.queue);
     }
@@ -225,6 +230,13 @@ impl State {
         output.present();
         
         Ok(())
+    }
+
+    // Use the window in the app to request redraw
+    fn request_redraw(&self, app: &H3GlobeApp) {
+        if let Some(window) = &app.window {
+            window.request_redraw();
+        }
     }
 }
 
@@ -329,6 +341,13 @@ impl winit::application::ApplicationHandler for H3GlobeApp {
                         state.globe.decrease_resolution();
                     } else if key == "m" || key == "M" {
                         state.globe.toggle_render_mode();
+                    }
+                }
+                WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                    // Get the new inner size directly from the window
+                    if let Some(window) = &self.window {
+                        let new_size = window.inner_size();
+                        state.resize(new_size);
                     }
                 }
                 _ => {}

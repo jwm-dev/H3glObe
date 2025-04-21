@@ -54,6 +54,7 @@ struct GlobeUniform {
 }
 
 // H3 Resolution wrapper
+#[derive(Clone)]
 pub struct H3Resolution {
     resolution: u8,
 }
@@ -83,39 +84,27 @@ impl H3Resolution {
 }
 
 pub struct Globe {
-    // Graphics pipeline
     pipeline: wgpu::RenderPipeline,
-    
-    // Buffers
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
-    triangle_index_buffer: wgpu::Buffer, // Separate buffer for triangle indices
+    triangle_index_buffer: wgpu::Buffer,
     num_indices: u32,
-    num_triangle_indices: u32,          // Count of triangle indices
-    
-    // Uniform binding
+    num_triangle_indices: u32,
     globe_uniform: GlobeUniform,
     globe_uniform_buffer: wgpu::Buffer,
     globe_bind_group: wgpu::BindGroup,
-    
-    // Depth resources
     depth_texture: wgpu::Texture,
     depth_texture_view: wgpu::TextureView,
-    
-    // H3 settings
     h3_resolution: H3Resolution,
-    
-    // Device reference
     device: wgpu::Device,
-    
-    // Base cell colors
     base_cell_colors: Vec<[f32; 3]>,
-    
-    // Rendering mode
     render_solid: bool,
-    
-    // Elevation data
     elevation_data: Option<Arc<ElevationData>>,
+    
+    // Fields for hot-switching support
+    pending_resolution: Option<H3Resolution>,
+    is_loading_resolution: bool,
+    background_loader_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Globe {
@@ -271,6 +260,9 @@ impl Globe {
             base_cell_colors,
             render_solid: false,
             elevation_data,
+            pending_resolution: None,
+            is_loading_resolution: false,
+            background_loader_handle: None,
         }
     }
     
@@ -311,14 +303,166 @@ impl Globe {
         self.depth_texture_view = new_depth_view;
     }
 
+    // Update the increase_resolution method to use hot-switching
     pub fn increase_resolution(&mut self) {
-        self.h3_resolution.increase();
-        self.regenerate_geometry();
+        // Only allow resolution change if not already loading
+        if self.is_loading_resolution {
+            println!("Resolution change already in progress, please wait...");
+            return;
+        }
+        
+        // Create a new resolution object
+        let mut new_res = H3Resolution::new(self.h3_resolution.value());
+        new_res.increase();
+        
+        // If resolution didn't change (already at max), do nothing
+        if new_res.value() == self.h3_resolution.value() {
+            return;
+        }
+        
+        // Set the pending resolution
+        self.pending_resolution = Some(new_res);
+        
+        // Start hot-switching process
+        self.start_resolution_hot_switch();
     }
     
+    // Update the decrease_resolution method to use hot-switching
     pub fn decrease_resolution(&mut self) {
-        self.h3_resolution.decrease();
-        self.regenerate_geometry();
+        // Only allow resolution change if not already loading
+        if self.is_loading_resolution {
+            println!("Resolution change already in progress, please wait...");
+            return;
+        }
+        
+        // Create a new resolution object
+        let mut new_res = H3Resolution::new(self.h3_resolution.value());
+        new_res.decrease();
+        
+        // If resolution didn't change (already at min), do nothing
+        if new_res.value() == self.h3_resolution.value() {
+            return;
+        }
+        
+        // Set the pending resolution
+        self.pending_resolution = Some(new_res);
+        
+        // Start hot-switching process
+        self.start_resolution_hot_switch();
+    }
+    
+    // New method to start the resolution hot-switching process
+    fn start_resolution_hot_switch(&mut self) {
+        if self.pending_resolution.is_none() || self.is_loading_resolution {
+            return;
+        }
+        
+        // Mark that we're loading a new resolution
+        self.is_loading_resolution = true;
+        
+        // Get the new resolution
+        let new_res = self.pending_resolution.clone().unwrap();
+        println!("Starting hot-switch to resolution {}", new_res.value());
+        
+        // Clone the elevation data reference for the background thread
+        let elevation_data_clone = self.elevation_data.clone();
+        let device_clone = self.device.clone();
+        let new_res_for_thread = new_res.clone();
+        
+        // Start a background thread to process the new resolution
+        let handle = std::thread::spawn(move || {
+            // Check if we have elevation data
+            if let Some(elev_data) = elevation_data_clone {
+                // Use GPU acceleration to process cells for the new resolution
+                let res_obj = Resolution::try_from(new_res_for_thread.value()).unwrap();
+                
+                // Set up a progress callback
+                let new_res_for_callback = new_res_for_thread.clone();
+                let progress_callback = move |progress: f32| {
+                    println!("Processing resolution {}: {:.1}%", new_res_for_callback.value(), progress * 100.0);
+                };
+                
+                // Process cells using GPU acceleration
+                match elev_data.process_cells_for_resolution_gpu(res_obj, Some(progress_callback)) {
+                    Ok(_) => println!("Successfully processed cells for resolution {}", new_res_for_thread.value()),
+                    Err(e) => eprintln!("Failed to process cells for resolution {}: {}", new_res_for_thread.value(), e),
+                }
+                
+                // Pre-generate geometry for faster switching
+                let (_vertices, _indices, _triangle_indices) = 
+                    generate_h3_cells_with_elevation(&new_res_for_thread, Some(elev_data));
+                println!("Pre-generated geometry for resolution {}", new_res_for_thread.value());
+            } else {
+                // No elevation data, just pre-generate the geometry
+                let (_vertices, _indices, _triangle_indices) = generate_h3_cells(&new_res_for_thread);
+                println!("Pre-generated geometry for resolution {} (no elevation data)", new_res_for_thread.value());
+            }
+        });
+        
+        self.background_loader_handle = Some(handle);
+    }
+    
+    // Method to check if resolution loading is complete
+    pub fn check_resolution_loading(&mut self) -> bool {
+        if let Some(elev_data) = &self.elevation_data {
+            if let Some(loading_res) = self.pending_resolution.clone() {
+                // If we're waiting for a resolution to load, check its status
+                // Convert loading_res to Resolution type
+                let res_obj = Resolution::try_from(loading_res.value()).unwrap_or(Resolution::Zero);
+                let is_loaded = elev_data.is_resolution_loaded(res_obj);
+                
+                if is_loaded {
+                    // If loaded, update the current resolution and clear loading flag
+                    // Update resolution only if it's different from what we already have
+                    if self.h3_resolution.value() != loading_res.value() {
+                        self.h3_resolution = loading_res;
+                        // Regenerate the geometry to update the visible mesh - this was missing!
+                        self.regenerate_geometry();
+                    }
+                    self.pending_resolution = None;
+                    self.is_loading_resolution = false;
+                    return true; // Resolution change completed
+                }
+            }
+        } else if let Some(handle) = self.background_loader_handle.take() {
+            if handle.is_finished() {
+                // For non-elevation mode, just check if the background thread is done
+                // This is a simpler case as we just wait for the thread to complete
+                if let Some(new_res) = self.pending_resolution.take() {
+                    // Join the thread to ensure it's completed properly
+                    if let Err(e) = handle.join() {
+                        eprintln!("Error joining background thread: {:?}", e);
+                    }
+                    
+                    // Update the resolution and regenerate geometry
+                    self.h3_resolution = new_res;
+                    // Regenerate the geometry to update the visible mesh - this was missing!
+                    self.regenerate_geometry();
+                    self.is_loading_resolution = false;
+                    return true; // Resolution change completed
+                }
+            } else {
+                // Put the handle back if thread is still running
+                self.background_loader_handle = Some(handle);
+            }
+        }
+        
+        false // No resolution change completed
+    }
+    
+    // Method to get current loading status
+    pub fn is_loading(&self) -> bool {
+        self.is_loading_resolution
+    }
+    
+    // Method to get loading progress (stub - would need to be enhanced with actual progress tracking)
+    pub fn loading_progress(&self) -> f32 {
+        if self.is_loading_resolution {
+            // In a real implementation, we'd track actual progress
+            0.5 // Placeholder
+        } else {
+            0.0
+        }
     }
     
     fn regenerate_geometry(&mut self) {
@@ -468,6 +612,11 @@ impl Globe {
             multiview: None,
             cache: None,
         });
+    }
+
+    // Add the get_resolution method to retrieve current resolution
+    pub fn get_resolution(&self) -> Resolution {
+        Resolution::try_from(self.h3_resolution.value()).unwrap_or(Resolution::Zero)
     }
 }
 

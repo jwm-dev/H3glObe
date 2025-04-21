@@ -25,6 +25,7 @@ anyhow = "1.0.98"
 tokio = { version = "1.44.2", features = ["rt", "sync", "rt-multi-thread"] }
 serde = "1.0.219"
 futures = "0.3.31"
+futures-intrusive = "0.5.0"  # Added for oneshot_channel
 
 # GeoTIFF and elevation data processing dependencies
 gdal = { version = "0.16.0", features = ["array", "bindgen"] }
